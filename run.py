@@ -15,7 +15,7 @@ from dateutil import parser as dt_parser
 BJ_TZ = timezone(timedelta(hours=8))
 ROOT = Path(__file__).parent
 DOCS = ROOT / "docs"
-ASSETS = DOCS / "assets"
+RUNS = DOCS / "runs"
 STATE_FILE = ROOT / "state_seen.json"
 
 
@@ -271,13 +271,14 @@ def summarize(article: dict) -> dict:
     return call_llm(prompt)
 
 
-def download_image(url: str, idx: int) -> Optional[str]:
+def download_image(url: str, idx: int, run_id: str) -> Optional[str]:
     if not url:
         return None
-    ASSETS.mkdir(parents=True, exist_ok=True)
+    assets_dir = RUNS / run_id / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
     ext = ".png" if ".png" in url.lower() else ".jpg"
     name = f"cover_{idx:03d}{ext}"
-    path = ASSETS / name
+    path = assets_dir / name
     try:
         with httpx.Client(timeout=20, follow_redirects=True) as c:
             r = c.get(url)
@@ -288,8 +289,9 @@ def download_image(url: str, idx: int) -> Optional[str]:
         return None
 
 
-def render(records: List[dict]) -> Path:
-    DOCS.mkdir(parents=True, exist_ok=True)
+def render(records: List[dict], run_id: str) -> Path:
+    run_dir = RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
     cards = []
     for r in records:
         points = "".join([f"<li>{x}</li>" for x in r["summary"].get("key_points", [])[:5]])
@@ -344,12 +346,36 @@ a:hover{{text-decoration:underline;}}
   </main>
 </body>
 </html>"""
-    out = DOCS / "index.html"
+    out = run_dir / "index.html"
     out.write_text(html, encoding="utf-8")
     return out
 
 
+def render_portal(run_id: str, records_count: int) -> Path:
+    DOCS.mkdir(parents=True, exist_ok=True)
+    links = []
+    for p in sorted(RUNS.glob("*/index.html"), reverse=True):
+        rid = p.parent.name
+        links.append(f'<li><a href="./runs/{rid}/">{rid}</a></li>')
+        if len(links) >= 20:
+            break
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>CN WSJ Daily Briefing Portal</title></head>
+<body style="font-family:Arial,sans-serif;max-width:860px;margin:24px auto;padding:0 12px;">
+  <h1>CN WSJ Daily Briefing</h1>
+  <p>最新版本：<a href="./runs/{run_id}/">{run_id}</a>（{records_count} 篇）</p>
+  <h3>历史版本（最近20次）</h3>
+  <ul>{''.join(links)}</ul>
+</body></html>"""
+    portal = DOCS / "index.html"
+    portal.write_text(html, encoding="utf-8")
+    return portal
+
+
 def run() -> int:
+    run_id = now_bj().strftime("%Y-%m-%d_%H-%M-%S")
     cookies = load_netscape_cookies()
     now = now_bj()
     links = article_links(cookies)
@@ -366,7 +392,7 @@ def run() -> int:
             continue
         seen.add(key)
         s = summarize(art)
-        local_img = download_image(art.get("image_url", ""), idx)
+        local_img = download_image(art.get("image_url", ""), idx, run_id)
         records.append(
             {
                 "url": art["url"],
@@ -377,9 +403,11 @@ def run() -> int:
                 "summary": s,
             }
         )
-    render(records)
+    run_page = render(records, run_id)
+    render_portal(run_id, len(records))
     save_seen(seen)
-    print(f"Generated docs/index.html with {len(records)} articles.")
+    print(f"Generated run page: {run_page}")
+    print(f"Latest portal: {DOCS / 'index.html'}")
     return 0
 
 
