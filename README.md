@@ -22,9 +22,12 @@ export COOKIE_FILE="/absolute/path/to/cn.wsj.com_netscape_xxx.txt"
 python run.py
 ```
 
-Output page:
+Output:
 
-- `docs/index.html`
+- Portal（指向最新一次）：`docs/index.html`
+- 每次带时间戳的版本：`docs/runs/YYYY-MM-DD_HH-MM-SS/index.html`
+
+每次运行会抓取「当前时刻往回 24 小时内」且能解析到正文的文章；**不会在多次运行之间永久跳过已处理 URL**，以免第二次只剩极少数「新」链接。
 
 ## Env Vars
 

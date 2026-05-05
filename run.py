@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
-import hashlib
+import html
 import json
 import os
 from dataclasses import dataclass
@@ -16,7 +16,6 @@ BJ_TZ = timezone(timedelta(hours=8))
 ROOT = Path(__file__).parent
 DOCS = ROOT / "docs"
 RUNS = DOCS / "runs"
-STATE_FILE = ROOT / "state_seen.json"
 
 
 @dataclass
@@ -198,24 +197,6 @@ def parse_article(url: str, cookies: Dict[str, str]) -> Optional[dict]:
         return None
 
 
-def unique_key(article: dict) -> str:
-    h = hashlib.sha1(article["title"].strip().lower().encode("utf-8")).hexdigest()[:16]
-    return f"{article['url']}::{h}"
-
-
-def load_seen() -> set:
-    if not STATE_FILE.exists():
-        return set()
-    try:
-        return set(json.loads(STATE_FILE.read_text(encoding="utf-8")).get("seen", []))
-    except Exception:
-        return set()
-
-
-def save_seen(keys: set) -> None:
-    STATE_FILE.write_text(json.dumps({"seen": list(keys)[-5000:]}, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 def call_llm(prompt: str) -> dict:
     models = [get_model("PRIMARY"), get_model("FALLBACK")]
     for cfg in models:
@@ -271,7 +252,7 @@ def summarize(article: dict) -> dict:
     return call_llm(prompt)
 
 
-def download_image(url: str, idx: int, run_id: str) -> Optional[str]:
+def download_image(url: str, idx: int, run_id: str, cookies: Dict[str, str]) -> Optional[str]:
     if not url:
         return None
     assets_dir = RUNS / run_id / "assets"
@@ -280,8 +261,9 @@ def download_image(url: str, idx: int, run_id: str) -> Optional[str]:
     name = f"cover_{idx:03d}{ext}"
     path = assets_dir / name
     try:
+        headers = {"User-Agent": "Mozilla/5.0"}
         with httpx.Client(timeout=20, follow_redirects=True) as c:
-            r = c.get(url)
+            r = c.get(url, headers=headers, cookies=cookies or None)
             r.raise_for_status()
             path.write_bytes(r.content)
         return f"./assets/{name}"
@@ -294,24 +276,32 @@ def render(records: List[dict], run_id: str) -> Path:
     run_dir.mkdir(parents=True, exist_ok=True)
     cards = []
     for r in records:
-        points = "".join([f"<li>{x}</li>" for x in r["summary"].get("key_points", [])[:5]])
-        risks = "".join([f"<li>{x}</li>" for x in r["summary"].get("risks", [])[:3]])
-        img = f"<img class='hero' src='{r['image_local']}' alt='hero image'/>" if r.get("image_local") else ""
+        pts = r["summary"].get("key_points", [])[:5]
+        rsk = r["summary"].get("risks", [])[:3]
+        points = "".join([f"<li>{html.escape(str(x))}</li>" for x in pts])
+        risks = "".join([f"<li>{html.escape(str(x))}</li>" for x in rsk])
+        safe_title = html.escape(r["title"])
+        safe_lede = html.escape(r["lede"])
+        safe_pub = html.escape(r.get("published", "") or "unknown")
+        img_src = html.escape(r["image_local"]) if r.get("image_local") else ""
+        img = f"<img class='hero' src='{img_src}' alt=''/>" if r.get("image_local") else ""
+        kw = html.escape(", ".join(r["summary"].get("keywords", []) or []))
+        ent = html.escape(", ".join(r["summary"].get("entities", []) or []))
         cards.append(
             f"""
             <article class="story">
               {img}
-              <h2>{r['title']}</h2>
-              <p class="lede">{r['lede']}</p>
-              <p class="meta">发布时间（北京时间）：{r.get('published', 'unknown')}</p>
-              <p><strong>AI 摘要</strong> {r['summary'].get('ai_summary','')}</p>
-              <p><strong>市场影响</strong> {r['summary'].get('market_impact','')}</p>
-              <p><strong>关键词</strong> {", ".join(r['summary'].get('keywords', []))}</p>
-              <p><strong>实体</strong> {", ".join(r['summary'].get('entities', []))}</p>
-              <p><strong>情绪</strong> {r['summary'].get('sentiment', 'neutral')}</p>
+              <h2>{safe_title}</h2>
+              <p class="lede">{safe_lede}</p>
+              <p class="meta">发布时间（北京时间）：{safe_pub}</p>
+              <p><strong>AI 摘要</strong> {html.escape(str(r['summary'].get('ai_summary','')))}</p>
+              <p><strong>市场影响</strong> {html.escape(str(r['summary'].get('market_impact','')))}</p>
+              <p><strong>关键词</strong> {kw}</p>
+              <p><strong>实体</strong> {ent}</p>
+              <p><strong>情绪</strong> {html.escape(str(r['summary'].get('sentiment', 'neutral')))}</p>
               <ul>{points}</ul>
               <ul>{risks}</ul>
-              <p><a href="{r['url']}" target="_blank">查看原文</a></p>
+              <p><a href="{html.escape(r['url'], quote=True)}" target="_blank" rel="noopener">查看原文</a></p>
             </article>
             """
         )
@@ -351,12 +341,20 @@ a:hover{{text-decoration:underline;}}
     return out
 
 
+def _run_sort_key(path: Path) -> datetime:
+    try:
+        return datetime.strptime(path.parent.name, "%Y-%m-%d_%H-%M-%S").replace(tzinfo=BJ_TZ)
+    except ValueError:
+        return datetime(1970, 1, 1, tzinfo=BJ_TZ)
+
+
 def render_portal(run_id: str, records_count: int) -> Path:
     DOCS.mkdir(parents=True, exist_ok=True)
     links = []
-    for p in sorted(RUNS.glob("*/index.html"), reverse=True):
+    run_pages = sorted(RUNS.glob("*/index.html"), key=_run_sort_key, reverse=True)
+    for p in run_pages:
         rid = p.parent.name
-        links.append(f'<li><a href="./runs/{rid}/">{rid}</a></li>')
+        links.append(f'<li><a href="./runs/{html.escape(rid)}/">{html.escape(rid)}</a></li>')
         if len(links) >= 20:
             break
     html = f"""<!doctype html>
@@ -365,7 +363,7 @@ def render_portal(run_id: str, records_count: int) -> Path:
 <title>CN WSJ Daily Briefing Portal</title></head>
 <body style="font-family:Arial,sans-serif;max-width:860px;margin:24px auto;padding:0 12px;">
   <h1>CN WSJ Daily Briefing</h1>
-  <p>最新版本：<a href="./runs/{run_id}/">{run_id}</a>（{records_count} 篇）</p>
+  <p>最新版本：<a href="./runs/{html.escape(run_id)}/">{html.escape(run_id)}</a>（{records_count} 篇）</p>
   <h3>历史版本（最近20次）</h3>
   <ul>{''.join(links)}</ul>
 </body></html>"""
@@ -377,22 +375,25 @@ def render_portal(run_id: str, records_count: int) -> Path:
 def run() -> int:
     run_id = now_bj().strftime("%Y-%m-%d_%H-%M-%S")
     cookies = load_netscape_cookies()
+    if not cookies:
+        print("警告：未读取到 COOKIE_FILE，cn.wsj.com 可能返回 401。")
     now = now_bj()
     links = article_links(cookies)
-    seen = load_seen()
+    seen_urls: set = set()
     records = []
-    for idx, link in enumerate(links, start=1):
+    idx = 0
+    for link in links:
+        if link in seen_urls:
+            continue
         art = parse_article(link, cookies)
         if not art:
             continue
         if not in_last_24h(art.get("published_bj"), now):
             continue
-        key = unique_key(art)
-        if key in seen:
-            continue
-        seen.add(key)
+        seen_urls.add(link)
+        idx += 1
         s = summarize(art)
-        local_img = download_image(art.get("image_url", ""), idx, run_id)
+        local_img = download_image(art.get("image_url", ""), idx, run_id, cookies)
         records.append(
             {
                 "url": art["url"],
@@ -405,7 +406,6 @@ def run() -> int:
         )
     run_page = render(records, run_id)
     render_portal(run_id, len(records))
-    save_seen(seen)
     print(f"Generated run page: {run_page}")
     print(f"Latest portal: {DOCS / 'index.html'}")
     return 0
