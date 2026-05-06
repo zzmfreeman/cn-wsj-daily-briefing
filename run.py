@@ -3,6 +3,7 @@ import asyncio
 import html
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -197,7 +198,28 @@ def parse_article(url: str, cookies: Dict[str, str]) -> Optional[dict]:
         return None
 
 
-def call_llm(prompt: str) -> dict:
+def _fallback_from_article(article: dict) -> dict:
+    body = (article.get("body") or "").strip()
+    chunks = [s.strip() for s in re.split(r"[。！？\n]+", body) if len(s.strip()) > 20]
+    key_points = chunks[:5] if chunks else ["正文过短，无法提炼要点。"]
+    lead = (article.get("lede") or "").strip()
+    ai_summary = (
+        (lead + " ")[:80] + (chunks[0] if chunks else "请阅读原文。")
+    )[:220]
+    if len(ai_summary) < 40 and chunks:
+        ai_summary = chunks[0][:220]
+    return {
+        "ai_summary": ai_summary,
+        "key_points": key_points,
+        "risks": ["未调用远程模型，以下为基于正文的机械摘录。", "数字、时间与主体请以原文为准。"],
+        "market_impact": "需结合后续披露与市场数据评估影响方向。",
+        "keywords": [],
+        "entities": [],
+        "sentiment": "neutral",
+    }
+
+
+def call_llm(prompt: str, article: Optional[dict] = None) -> dict:
     models = [get_model("PRIMARY"), get_model("FALLBACK")]
     for cfg in models:
         if not cfg:
@@ -221,15 +243,7 @@ def call_llm(prompt: str) -> dict:
                 return json.loads(content)
             except Exception:
                 pass
-    return {
-        "ai_summary": "当前无可用模型，使用本地兜底摘要。建议配置主备模型以提升质量。",
-        "key_points": [x for x in prompt.split("\n")[:5] if x][:3],
-        "risks": ["兜底摘要可能遗漏细节。", "请对关键事实做人工复核。"],
-        "market_impact": "短期影响需结合后续市场数据判断。",
-        "keywords": ["WSJ", "市场", "风险", "政策", "观察"],
-        "entities": ["WSJ", "市场参与者", "监管机构"],
-        "sentiment": "neutral",
-    }
+    return _fallback_from_article(article or {})
 
 
 def summarize(article: dict) -> dict:
@@ -249,7 +263,7 @@ def summarize(article: dict) -> dict:
 正文:
 {article['body']}
 """
-    return call_llm(prompt)
+    return call_llm(prompt, article)
 
 
 def download_image(url: str, idx: int, run_id: str, cookies: Dict[str, str]) -> Optional[str]:
@@ -275,69 +289,193 @@ def render(records: List[dict], run_id: str) -> Path:
     run_dir = RUNS / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     cards = []
-    for r in records:
-        pts = r["summary"].get("key_points", [])[:5]
-        rsk = r["summary"].get("risks", [])[:3]
-        points = "".join([f"<li>{html.escape(str(x))}</li>" for x in pts])
-        risks = "".join([f"<li>{html.escape(str(x))}</li>" for x in rsk])
+    for i, r in enumerate(records, start=1):
+        summ = r.get("summary") or {}
+        pts = [str(x).strip() for x in summ.get("key_points", []) if str(x).strip()][:5]
+        rsk = [str(x).strip() for x in summ.get("risks", []) if str(x).strip()][:3]
+        points = "".join([f"<li>{html.escape(x)}</li>" for x in pts])
+        risks = "".join([f"<li>{html.escape(x)}</li>" for x in rsk])
         safe_title = html.escape(r["title"])
         safe_lede = html.escape(r["lede"])
-        safe_pub = html.escape(r.get("published", "") or "unknown")
+        safe_pub = html.escape(r.get("published", "") or "—")
+        safe_url = html.escape(r["url"], quote=True)
         img_src = html.escape(r["image_local"]) if r.get("image_local") else ""
-        img = f"<img class='hero' src='{img_src}' alt=''/>" if r.get("image_local") else ""
-        kw = html.escape(", ".join(r["summary"].get("keywords", []) or []))
-        ent = html.escape(", ".join(r["summary"].get("entities", []) or []))
+        og_img = html.escape(r.get("image_url") or "", quote=True)
+        if r.get("image_local"):
+            hero_block = f"""<figure class="hero-wrap">
+  <img class="hero" src="{img_src}" alt="" loading="lazy"/>
+  <figcaption class="fig-cap">主配图 · Hero <span class="mono">{og_img}</span></figcaption>
+</figure>"""
+        else:
+            hero_block = """<figure class="hero-wrap hero-missing">
+  <div class="hero-placeholder">暂无主配图（站点未返回 og:image 或下载失败）</div>
+</figure>"""
+
+        kws = summ.get("keywords") or []
+        ents = summ.get("entities") or []
+        kw_line = (
+            f'<p class="meta-line"><span class="lbl">关键词 Keywords</span> {html.escape(", ".join(str(x) for x in kws))}</p>'
+            if kws
+            else ""
+        )
+        ent_line = (
+            f'<p class="meta-line"><span class="lbl">实体 Entities</span> {html.escape(", ".join(str(x) for x in ents))}</p>'
+            if ents
+            else ""
+        )
+        sent = html.escape(str(summ.get("sentiment", "neutral")))
         cards.append(
             f"""
-            <article class="story">
-              {img}
-              <h2>{safe_title}</h2>
-              <p class="lede">{safe_lede}</p>
-              <p class="meta">发布时间（北京时间）：{safe_pub}</p>
-              <p><strong>AI 摘要</strong> {html.escape(str(r['summary'].get('ai_summary','')))}</p>
-              <p><strong>市场影响</strong> {html.escape(str(r['summary'].get('market_impact','')))}</p>
-              <p><strong>关键词</strong> {kw}</p>
-              <p><strong>实体</strong> {ent}</p>
-              <p><strong>情绪</strong> {html.escape(str(r['summary'].get('sentiment', 'neutral')))}</p>
-              <ul>{points}</ul>
-              <ul>{risks}</ul>
-              <p><a href="{html.escape(r['url'], quote=True)}" target="_blank" rel="noopener">查看原文</a></p>
-            </article>
-            """
+<article class="story" id="article-{i}">
+  <div class="story-rail">
+    <span class="index">{i:02d}</span>
+  </div>
+  <div class="story-body">
+    <p class="section-label">原始标题 · Headline</p>
+    <h2 class="headline">{safe_title}</h2>
+    <p class="meta pub">发布时间（北京时间）· Published <time>{safe_pub}</time></p>
+    <p class="section-label">导语 · Dek</p>
+    <blockquote class="dek">{safe_lede}</blockquote>
+    <p class="section-label">主配图 · Lead art</p>
+    {hero_block}
+    <div class="ai-block">
+      <p class="section-label">AI 摘要 · Brief</p>
+      <p class="ai-summary">{html.escape(str(summ.get("ai_summary", "")))}</p>
+      <p class="section-label">要点 · Key points</p>
+      <ul class="list-points">{points or "<li>—</li>"}</ul>
+      <p class="section-label">市场影响 · Market context</p>
+      <p class="body-text">{html.escape(str(summ.get("market_impact", "")))}</p>
+      <p class="section-label">风险与不确定性 · Risks</p>
+      <ul class="list-risks">{risks or "<li>—</li>"}</ul>
+      {kw_line}
+      {ent_line}
+      <p class="meta-line"><span class="lbl">情绪 Sentiment</span> <span class="sent-badge" data-sent="{sent}">{sent}</span></p>
+      <p class="source-line"><a href="{safe_url}" target="_blank" rel="noopener noreferrer">在 cn.wsj.com 打开原文 Open source</a></p>
+    </div>
+  </div>
+</article>
+"""
         )
 
     today = now_bj().strftime("%Y-%m-%d")
-    html = f"""<!doctype html>
+    safe_run = html.escape(run_id)
+    html_doc = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>CN WSJ Daily Briefing {today}</title>
+<title>CN WSJ Daily Briefing · {today}</title>
 <style>
-body{{margin:0;background:#f4f1ea;color:#111;font-family:Georgia,"Times New Roman",serif;}}
-.wrap{{max-width:980px;margin:0 auto;padding:24px 18px 40px;}}
-h1{{font-size:40px;letter-spacing:0.5px;margin:8px 0 4px;border-bottom:2px solid #111;padding-bottom:8px;}}
-.sub{{font-family:Arial,sans-serif;color:#444;margin-bottom:18px;}}
-.story{{background:#fff;border:1px solid #ddd;padding:18px 18px 14px;margin-bottom:18px;box-shadow:0 1px 0 rgba(0,0,0,.03);}}
-.hero{{width:100%;max-height:360px;object-fit:cover;margin-bottom:12px;border:1px solid #ddd;}}
-h2{{font-size:28px;line-height:1.3;margin:2px 0 8px;}}
-.lede{{font-size:18px;line-height:1.6;color:#222;}}
-.meta{{font-size:13px;color:#666;font-family:Arial,sans-serif;}}
-p,li{{font-size:17px;line-height:1.65;}}
-a{{color:#0a4a8a;text-decoration:none;}}
-a:hover{{text-decoration:underline;}}
+:root {{
+  --ink:#111; --paper:#f7f4ee; --card:#fff; --rule:#d4cfc4; --muted:#5c5c5c;
+  --accent:#0a4a8a; --rail:#8b2332;
+}}
+* {{ box-sizing:border-box; }}
+body {{
+  margin:0; background:var(--paper); color:var(--ink);
+  font-family: Georgia, "Times New Roman", "Songti SC", "SimSun", serif;
+  font-size:18px; line-height:1.65;
+}}
+.wrap {{
+  max-width:720px; margin:0 auto; padding:32px 20px 56px;
+}}
+.masthead {{
+  border-bottom:3px double var(--ink); padding-bottom:12px; margin-bottom:28px;
+}}
+.masthead h1 {{
+  font-size:clamp(1.75rem, 4vw, 2.35rem); font-weight:700; letter-spacing:0.02em;
+  margin:0 0 6px; line-height:1.15;
+}}
+.masthead .tagline {{
+  font-family: Arial, Helvetica, sans-serif; font-size:13px; color:var(--muted);
+  letter-spacing:0.04em; text-transform:uppercase;
+}}
+.masthead .run-id {{
+  font-family: ui-monospace, Menlo, monospace; font-size:12px; color:var(--muted); margin-top:6px;
+}}
+.story {{
+  display:flex; gap:16px; align-items:flex-start;
+  padding:28px 0; border-bottom:1px solid var(--rule);
+}}
+.story:last-of-type {{ border-bottom:none; }}
+.story-rail {{
+  flex:0 0 36px; text-align:right; padding-top:4px;
+}}
+.story-rail .index {{
+  font-family: Arial, sans-serif; font-size:12px; font-weight:700; color:var(--rail);
+  letter-spacing:0.06em;
+}}
+.story-body {{ flex:1; min-width:0; }}
+.section-label {{
+  font-family: Arial, Helvetica, sans-serif; font-size:11px; letter-spacing:0.12em;
+  text-transform:uppercase; color:var(--muted); margin:22px 0 8px;
+}}
+.section-label:first-of-type {{ margin-top:0; }}
+.headline {{
+  font-size:clamp(1.45rem, 3.2vw, 1.85rem); line-height:1.25; font-weight:700; margin:0 0 10px;
+}}
+.meta, .meta-line, .pub {{
+  font-family: Arial, Helvetica, sans-serif; font-size:13px; color:var(--muted);
+}}
+.pub time {{ font-variant-numeric: tabular-nums; }}
+.dek {{
+  margin:0; padding:12px 0 12px 16px; border-left:4px solid var(--ink);
+  font-size:1.08rem; line-height:1.6; color:#222;
+}}
+.hero-wrap {{ margin:0 0 8px; }}
+.hero {{
+  display:block; width:100%; max-height:420px; object-fit:cover;
+  border:1px solid var(--rule); background:var(--card);
+}}
+.hero-missing .hero-placeholder {{
+  border:1px dashed var(--rule); padding:28px 16px; text-align:center;
+  font-family: Arial, sans-serif; font-size:14px; color:var(--muted); background:var(--card);
+}}
+.fig-cap {{
+  font-family: Arial, sans-serif; font-size:11px; color:var(--muted); margin-top:6px; line-height:1.4;
+}}
+.fig-cap .mono {{ word-break:break-all; font-family: ui-monospace, Menlo, monospace; }}
+.ai-block {{ margin-top:8px; }}
+.ai-summary, .body-text {{
+  margin:0 0 12px; hyphens:auto;
+}}
+.list-points, .list-risks {{
+  margin:0 0 12px; padding-left:1.2em;
+}}
+.list-points li {{ margin-bottom:6px; }}
+.list-risks li {{ margin-bottom:6px; color:#333; }}
+.meta-line .lbl {{ font-weight:600; margin-right:6px; }}
+.sent-badge {{
+  display:inline-block; font-family: Arial, sans-serif; font-size:12px;
+  padding:2px 8px; border:1px solid var(--rule); border-radius:2px; text-transform:capitalize;
+}}
+.source-line {{
+  margin-top:18px; font-family: Arial, sans-serif; font-size:14px;
+}}
+a {{ color:var(--accent); text-decoration:none; }}
+a:hover {{ text-decoration:underline; }}
+@media print {{
+  body {{ background:#fff; }}
+  .story {{ break-inside:avoid; }}
+}}
+.empty {{
+  font-family: Arial, sans-serif; font-size:15px; color: var(--muted); padding: 24px 0;
+}}
 </style>
 </head>
 <body>
   <main class="wrap">
-    <h1>The Wall Street Journal China Briefing</h1>
-    <p class="sub">自动抓取 cn.wsj.com | 过去24小时（北京时间）| 生成时间：{now_bj().strftime("%Y-%m-%d %H:%M:%S")}</p>
-    {''.join(cards)}
+    <header class="masthead">
+      <h1>The Wall Street Journal</h1>
+      <p class="tagline">China edition briefing · cn.wsj.com</p>
+      <p class="run-id">Run · {safe_run} · 生成时间 Generated {html.escape(now_bj().strftime("%Y-%m-%d %H:%M:%S"))} · 过去24小时（北京时间）</p>
+    </header>
+    {''.join(cards) if cards else '<p class="empty">本版暂无符合条件的文章（时间窗口内无可用正文或全部被站点拦截）。</p>'}
   </main>
 </body>
 </html>"""
     out = run_dir / "index.html"
-    out.write_text(html, encoding="utf-8")
+    out.write_text(html_doc, encoding="utf-8")
     return out
 
 
@@ -400,6 +538,7 @@ def run() -> int:
                 "title": art["title"],
                 "lede": art["lede"],
                 "published": art["published_bj"].strftime("%Y-%m-%d %H:%M:%S") if art.get("published_bj") else "",
+                "image_url": art.get("image_url") or "",
                 "image_local": local_img,
                 "summary": s,
             }
