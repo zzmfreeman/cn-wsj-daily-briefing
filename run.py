@@ -203,19 +203,27 @@ def _fallback_from_article(article: dict) -> dict:
     chunks = [s.strip() for s in re.split(r"[。！？\n]+", body) if len(s.strip()) > 20]
     key_points = chunks[:5] if chunks else ["正文过短，无法提炼要点。"]
     lead = (article.get("lede") or "").strip()
-    ai_summary = (
-        (lead + " ")[:80] + (chunks[0] if chunks else "请阅读原文。")
-    )[:220]
-    if len(ai_summary) < 40 and chunks:
-        ai_summary = chunks[0][:220]
+    parts = []
+    if lead:
+        parts.append(lead.rstrip("。") + "。")
+    for c in chunks[:3]:
+        if c and c not in lead:
+            parts.append(c + ("。" if not c.endswith(("。", "！", "？")) else ""))
+        if sum(len(p) for p in parts) > 180:
+            break
+    ai_summary = "".join(parts)[:280].strip()
+    if len(ai_summary) < 50 and chunks:
+        ai_summary = chunks[0][:280]
     return {
         "ai_summary": ai_summary,
         "key_points": key_points,
-        "risks": ["未调用远程模型，以下为基于正文的机械摘录。", "数字、时间与主体请以原文为准。"],
-        "market_impact": "需结合后续披露与市场数据评估影响方向。",
+        "risks": ["以下为基于正文切分的摘录，非模型推理。", "数字、时间与主体请以原文为准。"],
+        "market_impact": "建议结合后续官方披露与市场数据评估影响。",
         "keywords": [],
         "entities": [],
-        "sentiment": "neutral",
+        "sentiment": "",
+        "_source": "fallback",
+        "_note": "本地摘录模式（未配置或未调用主备模型）。网页底部可配置 PRIMARY_/FALLBACK_ 环境变量以启用 AI 摘要。",
     }
 
 
@@ -240,10 +248,39 @@ def call_llm(prompt: str, article: Optional[dict] = None) -> dict:
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
                 if content.startswith("```"):
                     content = content.strip("`").replace("json", "", 1).strip()
-                return json.loads(content)
+                parsed = json.loads(content)
+                if isinstance(parsed, dict):
+                    parsed["_source"] = "llm"
+                    parsed["sentiment"] = str(parsed.get("sentiment", "neutral")).strip().lower()
+                return parsed
             except Exception:
                 pass
     return _fallback_from_article(article or {})
+
+
+def _strip_legacy_fallback_noise(text: str) -> str:
+    if not text:
+        return ""
+    lines = [ln for ln in text.splitlines() if "当前无可用模型" not in ln and "建议配置主备模型" not in ln]
+    return "\n".join(lines).strip()
+
+
+def _sentiment_display_html(summ: dict) -> str:
+    src = summ.get("_source", "llm")
+    if src == "fallback":
+        return (
+            '<p class="meta-line sentiment-note"><span class="lbl">情绪 Sentiment</span> '
+            "<strong>未判定</strong> · 当前为正文摘录模式，未调用语言模型，不做偏多/偏空判断。</p>"
+        )
+    raw = str(summ.get("sentiment", "neutral")).strip().lower()
+    zh = {"positive": "偏多 · Positive bias", "neutral": "中性 · Neutral", "negative": "偏空 · Negative bias"}.get(
+        raw, f"中性 · {html.escape(raw)}"
+    )
+    safe = html.escape(raw)
+    return (
+        f'<p class="meta-line"><span class="lbl">情绪 Sentiment</span> '
+        f'<span class="sent-badge" data-sent="{safe}">{html.escape(zh)}</span></p>'
+    )
 
 
 def summarize(article: dict) -> dict:
@@ -323,7 +360,11 @@ def render(records: List[dict], run_id: str) -> Path:
             if ents
             else ""
         )
-        sent = html.escape(str(summ.get("sentiment", "neutral")))
+        brief_text = _strip_legacy_fallback_noise(str(summ.get("ai_summary", "")))
+        note_html = ""
+        if summ.get("_note"):
+            note_html = f'<p class="footnote">{html.escape(str(summ["_note"]))}</p>'
+        sent_row = _sentiment_display_html(summ)
         cards.append(
             f"""
 <article class="story" id="article-{i}">
@@ -340,7 +381,8 @@ def render(records: List[dict], run_id: str) -> Path:
     {hero_block}
     <div class="ai-block">
       <p class="section-label">AI 摘要 · Brief</p>
-      <p class="ai-summary">{html.escape(str(summ.get("ai_summary", "")))}</p>
+      <p class="ai-summary">{html.escape(brief_text)}</p>
+      {note_html}
       <p class="section-label">要点 · Key points</p>
       <ul class="list-points">{points or "<li>—</li>"}</ul>
       <p class="section-label">市场影响 · Market context</p>
@@ -349,7 +391,7 @@ def render(records: List[dict], run_id: str) -> Path:
       <ul class="list-risks">{risks or "<li>—</li>"}</ul>
       {kw_line}
       {ent_line}
-      <p class="meta-line"><span class="lbl">情绪 Sentiment</span> <span class="sent-badge" data-sent="{sent}">{sent}</span></p>
+      {sent_row}
       <p class="source-line"><a href="{safe_url}" target="_blank" rel="noopener noreferrer">在 cn.wsj.com 打开原文 Open source</a></p>
     </div>
   </div>
@@ -445,6 +487,12 @@ body {{
 .list-points li {{ margin-bottom:6px; }}
 .list-risks li {{ margin-bottom:6px; color:#333; }}
 .meta-line .lbl {{ font-weight:600; margin-right:6px; }}
+.footnote {{
+  font-family: Arial, sans-serif; font-size:12px; color: var(--muted); margin: -4px 0 14px;
+  line-height:1.45; padding-left: 2px;
+}}
+.sentiment-note {{ margin-top: 10px; }}
+.sentiment-note strong {{ font-weight: 600; }}
 .sent-badge {{
   display:inline-block; font-family: Arial, sans-serif; font-size:12px;
   padding:2px 8px; border:1px solid var(--rule); border-radius:2px; text-transform:capitalize;

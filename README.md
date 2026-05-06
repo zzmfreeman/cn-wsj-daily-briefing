@@ -34,3 +34,5 @@ Output:
 - `COOKIE_FILE`
 - `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `PRIMARY_MODEL`
 - `FALLBACK_BASE_URL`, `FALLBACK_API_KEY`, `FALLBACK_MODEL`
+
+未配置上述模型变量时，页面使用「正文摘录」生成摘要，**情绪一栏会显示未判定**；配置后即可输出模型摘要与偏多/中性/偏空判断。
