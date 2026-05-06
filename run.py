@@ -543,7 +543,7 @@ def render_portal(run_id: str, records_count: int) -> Path:
         links.append(f'<li><a href="./runs/{html.escape(rid)}/">{html.escape(rid)}</a></li>')
         if len(links) >= 20:
             break
-    html = f"""<!doctype html>
+    portal_html = f"""<!doctype html>
 <html lang="zh-CN">
 <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>CN WSJ Daily Briefing Portal</title></head>
@@ -554,7 +554,7 @@ def render_portal(run_id: str, records_count: int) -> Path:
   <ul>{''.join(links)}</ul>
 </body></html>"""
     portal = DOCS / "index.html"
-    portal.write_text(html, encoding="utf-8")
+    portal.write_text(portal_html, encoding="utf-8")
     return portal
 
 
