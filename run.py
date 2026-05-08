@@ -26,6 +26,12 @@ RUNS = DOCS / "runs"
 DEBUG_LOG_PATH = Path("/Users/zzm/.cursor/debug-0bdcc8.log")
 DEBUG_SESSION_ID = "0bdcc8"
 FETCH_HOME_META: Dict[str, str] = {}
+DEFAULT_WSJ_RSS_FEEDS = [
+    "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+    "https://feeds.a.dj.com/rss/RSSWSJD.xml",
+    "https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml",
+]
 
 
 def _sanitize_fetch_snippet(text: str) -> str:
@@ -386,6 +392,20 @@ def in_brief_window(published: Optional[datetime], now: datetime, hours: int) ->
     return now - timedelta(hours=hours) <= published <= now
 
 
+def allow_undated_articles() -> bool:
+    raw = os.getenv("ALLOW_UNDATED_ARTICLES", "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def max_undated_articles() -> int:
+    raw = os.getenv("MAX_UNDATED_ARTICLES", "5").strip()
+    try:
+        v = int(raw)
+        return max(0, min(30, v))
+    except Exception:
+        return 5
+
+
 def _xml_local_name(tag: str) -> str:
     return tag.split("}", 1)[1] if "}" in tag else tag
 
@@ -405,6 +425,24 @@ def _is_cn_article_url(url: str) -> bool:
         return False
 
 
+def _allow_non_cn_wsj_rss() -> bool:
+    raw = os.getenv("ALLOW_NON_CN_WSJ_RSS", "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _is_wsj_article_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        host = p.netloc.lower()
+        if not host.endswith("wsj.com"):
+            return False
+        path = (p.path or "").lower()
+        # Prefer article-like URLs; keep broad fallback for wsj RSS links.
+        return "/articles/" in path or path.count("/") >= 2
+    except Exception:
+        return False
+
+
 def html_fragment_to_text(fragment: str) -> str:
     if not fragment:
         return ""
@@ -415,9 +453,10 @@ def html_fragment_to_text(fragment: str) -> str:
 
 def rss_env_feed_urls() -> List[str]:
     raw = os.getenv("WSJ_RSS_URLS", os.getenv("RSS_URLS", "")).strip()
-    if not raw:
-        return []
-    return [x.strip() for x in raw.split(",") if x.strip()]
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    # Default to the same official WSJ feeds used historically in openclaw.
+    return list(DEFAULT_WSJ_RSS_FEEDS)
 
 
 def fetch_rss_xml(feed_url: str, run_id: str) -> str:
@@ -452,9 +491,13 @@ def parse_rss_items(xml_text: str, run_id: str, feed_url: str) -> List[Tuple[str
             return
         if not link_u.startswith("http"):
             return
-        if not _is_cn_article_url(canonical_wsj_article_url(link_u)):
-            return
         canon = canonical_wsj_article_url(link_u)
+        if _is_cn_article_url(canon):
+            pass
+        elif _allow_non_cn_wsj_rss() and _is_wsj_article_url(canon):
+            pass
+        else:
+            return
         try:
             slug = urlparse(canon).path.rstrip("/").rsplit("/", 1)[-1]
         except Exception:
@@ -1092,17 +1135,20 @@ def run() -> int:
             seen_merge.add(c)
             ordered.append(c)
 
+    now = now_bj()
+    window_h = brief_window_hours()
+    allow_undated = allow_undated_articles()
+    undated_cap = max_undated_articles()
+    undated_kept = 0
     print(
         f"[DEBUG] discovery={discovery!r} rss_feeds={len(rss_feed_urls)} rss_items={len(rss_hints)} "
-        f"homepage_links={len(home_links)} merged={len(ordered)}"
+        f"homepage_links={len(home_links)} merged={len(ordered)} window_h={window_h} "
+        f"allow_undated={allow_undated} undated_cap={undated_cap}"
     )
 
     if discovery == "rss" and not rss_feed_urls:
         print("[ERROR] ARTICLE_DISCOVERY=rss 但未配置 WSJ_RSS_URLS（或 RSS_URLS）。")
         return 2
-
-    now = now_bj()
-    window_h = brief_window_hours()
     home_snip = FETCH_HOME_META.get("http_401_body", "")
     if discovery in ("homepage", "both") and len(home_links) == 0 and (
         "captcha-delivery" in home_snip.lower() or "geo.captcha-delivery" in home_snip.lower()
@@ -1124,6 +1170,7 @@ def run() -> int:
 
     seen_urls: set = set()
     records = []
+    parsed_articles: List[dict] = []
     parsed_ok = 0
     missing_time = 0
     out_of_window = 0
@@ -1140,15 +1187,25 @@ def run() -> int:
         if not art:
             continue
         parsed_ok += 1
+        parsed_articles.append(art)
         if not in_brief_window(art.get("published_bj"), now, window_h):
             if not art.get("published_bj"):
                 missing_time += 1
+                if allow_undated and undated_kept < undated_cap:
+                    undated_kept += 1
+                    art["_undated_included"] = True
+                else:
+                    continue
             else:
                 out_of_window += 1
-            continue
+                continue
         seen_urls.add(link)
         idx += 1
         s = summarize(art)
+        if art.get("_undated_included"):
+            note = str(s.get("_note") or "").strip()
+            extra = f"发布时间缺失，按无时间兜底策略纳入（最多 {undated_cap} 篇）。"
+            s["_note"] = (note + " " + extra).strip() if note else extra
         local_img = download_image(art.get("image_url", ""), idx, run_id, cookies)
         records.append(
             {
@@ -1161,6 +1218,49 @@ def run() -> int:
                 "summary": s,
             }
         )
+    allow_stale = os.getenv("ALLOW_STALE_FALLBACK", "1").strip().lower() in ("1", "true", "yes", "on")
+    fallback_target = int(os.getenv("STALE_FALLBACK_LIMIT", "8").strip() or "8")
+    fallback_target = max(1, min(30, fallback_target))
+    if allow_stale and not records and parsed_articles:
+        print(
+            f"[FALLBACK] no records in {window_h}h window; include up to {fallback_target} parsed articles for continuity"
+        )
+        # #region agent log
+        _dbg(
+            run_id,
+            "H15",
+            "run.py:run",
+            "stale fallback activated",
+            {"parsed_ok": parsed_ok, "window_h": window_h, "fallback_target": fallback_target},
+        )
+        # #endregion
+        fallback_pool = sorted(
+            parsed_articles,
+            key=lambda a: (a.get("published_bj") is not None, a.get("published_bj") or datetime(1970, 1, 1, tzinfo=BJ_TZ)),
+            reverse=True,
+        )[:fallback_target]
+        for art in fallback_pool:
+            if art["url"] in seen_urls:
+                continue
+            seen_urls.add(art["url"])
+            idx += 1
+            s = summarize(art)
+            local_img = download_image(art.get("image_url", ""), idx, run_id, cookies)
+            if s.get("_source") == "fallback":
+                note = str(s.get("_note") or "").strip()
+                extra = f"本次未命中最近 {window_h} 小时时间窗，已回退展示最近可解析文章。"
+                s["_note"] = (note + " " + extra).strip() if note else extra
+            records.append(
+                {
+                    "url": art["url"],
+                    "title": art["title"],
+                    "lede": art["lede"],
+                    "published": art["published_bj"].strftime("%Y-%m-%d %H:%M:%S") if art.get("published_bj") else "",
+                    "image_url": art.get("image_url") or "",
+                    "image_local": local_img,
+                    "summary": s,
+                }
+            )
     run_page = render(records, run_id)
     render_portal(run_id, len(records))
     print(
@@ -1179,6 +1279,7 @@ def run() -> int:
             "parsed_ok": parsed_ok,
             "missing_time": missing_time,
             "out_of_window": out_of_window,
+            "undated_kept": undated_kept,
             "final_records": len(records),
         },
     )

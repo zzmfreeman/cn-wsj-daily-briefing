@@ -21,6 +21,7 @@ pip install -r requirements.txt
 
 # 推荐：DataDome 拦首页时，改用 RSS 发现 + 可选正文兜底
 export ARTICLE_DISCOVERY="both"   # homepage | rss | both
+# 可选：不填时会使用内置官方 WSJ feeds（Markets/World/Tech/Business）
 export WSJ_RSS_URLS="https://example.com/your-feed.xml"  # 逗号分隔多个
 
 export COOKIE_FILE="/absolute/path/to/cn.wsj.com_netscape_xxx.txt"   # 可选
@@ -38,7 +39,9 @@ Output:
 
 - `ARTICLE_DISCOVERY`：`homepage` | `rss` | `both`（默认 `both`）。`rss` 需配置 `WSJ_RSS_URLS`。
 - `BRIEF_WINDOW_HOURS`：汇入简报的时间窗口（默认 `24`，最大 `336`，即两周）。
-- `WSJ_RSS_URLS`（或 `RSS_URLS`）：逗号分隔的 RSS/Atom 地址。条目需包含指向 `https://cn.wsj.com/articles/...` 的链接。
+- `WSJ_RSS_URLS`（或 `RSS_URLS`）：逗号分隔的 RSS/Atom 地址。不填时默认使用官方 WSJ feeds（`feeds.a.dj.com`）。
+- `ALLOW_UNDATED_ARTICLES`：是否允许“无发布时间”文章兜底入选（默认 `1`）。
+- `MAX_UNDATED_ARTICLES`：无发布时间兜底最多纳入条数（默认 `5`）。
 - `COOKIE_FILE`
 - `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `PRIMARY_MODEL`
 - `FALLBACK_BASE_URL`, `FALLBACK_API_KEY`, `FALLBACK_MODEL`
