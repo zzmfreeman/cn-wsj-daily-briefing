@@ -42,6 +42,7 @@ Output:
 - `WSJ_RSS_URLS`（或 `RSS_URLS`）：逗号分隔的 RSS/Atom 地址。不填时默认使用官方 WSJ feeds（`feeds.a.dj.com`）。
 - `ALLOW_UNDATED_ARTICLES`：是否允许“无发布时间”文章兜底入选（默认 `1`）。
 - `MAX_UNDATED_ARTICLES`：无发布时间兜底最多纳入条数（默认 `5`）。
+- `AUTO_PUBLISH_GH_PAGES`：每次运行成功后自动 `git add/commit/push` `docs` 到 `origin/main`（默认 `1`，设为 `0` 关闭）。
 - `COOKIE_FILE`
 - `PRIMARY_BASE_URL`, `PRIMARY_API_KEY`, `PRIMARY_MODEL`
 - `FALLBACK_BASE_URL`, `FALLBACK_API_KEY`, `FALLBACK_MODEL`

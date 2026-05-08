@@ -5,6 +5,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import time
 import uuid
 from collections import Counter
@@ -1092,6 +1093,53 @@ def render_portal(run_id: str, records_count: int) -> Path:
     return portal
 
 
+def auto_publish_enabled() -> bool:
+    raw = os.getenv("AUTO_PUBLISH_GH_PAGES", "1").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _run_cmd(args: List[str]) -> Tuple[int, str, str]:
+    cp = subprocess.run(args, cwd=str(ROOT), capture_output=True, text=True)
+    return cp.returncode, cp.stdout.strip(), cp.stderr.strip()
+
+
+def publish_docs_to_github(run_id: str, records_count: int) -> None:
+    if not auto_publish_enabled():
+        print("[PUBLISH] auto publish disabled (AUTO_PUBLISH_GH_PAGES=0)")
+        return
+    git_dir = ROOT / ".git"
+    if not git_dir.exists():
+        print("[PUBLISH] skipped: not a git repository")
+        return
+
+    add_code, _, add_err = _run_cmd(["git", "add", "docs/index.html", f"docs/runs/{run_id}"])
+    if add_code != 0:
+        print(f"[PUBLISH] git add failed: {add_err or 'unknown error'}")
+        return
+
+    diff_code, _, _ = _run_cmd(["git", "diff", "--cached", "--quiet", "--", "docs"])
+    if diff_code == 0:
+        print("[PUBLISH] no docs changes to publish")
+        return
+
+    commit_msg = (
+        "Publish wsj briefing run\n\n"
+        f"Automatically publish run {run_id} with {records_count} records to GitHub Pages."
+    )
+    commit_code, _, commit_err = _run_cmd(["git", "commit", "-m", commit_msg])
+    if commit_code != 0:
+        print(f"[PUBLISH] git commit failed: {commit_err or 'unknown error'}")
+        return
+
+    push_code, push_out, push_err = _run_cmd(["git", "push", "origin", "main"])
+    if push_code != 0:
+        print(f"[PUBLISH] git push failed: {push_err or 'unknown error'}")
+        return
+    print(f"[PUBLISH] pushed to origin/main: run={run_id}, records={records_count}")
+    if push_out:
+        print(f"[PUBLISH] {push_out}")
+
+
 def run() -> int:
     run_id = now_bj().strftime("%Y-%m-%d_%H-%M-%S")
     FETCH_HOME_META.clear()
@@ -1284,6 +1332,7 @@ def run() -> int:
         },
     )
     # #endregion
+    publish_docs_to_github(run_id, len(records))
     print(f"Generated run page: {run_page}")
     print(f"Latest portal: {DOCS / 'index.html'}")
     return 0
