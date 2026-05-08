@@ -4,10 +4,16 @@ import html
 import json
 import os
 import re
+import socket
+import time
+import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+from xml.etree import ElementTree as ET
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -17,6 +23,40 @@ BJ_TZ = timezone(timedelta(hours=8))
 ROOT = Path(__file__).parent
 DOCS = ROOT / "docs"
 RUNS = DOCS / "runs"
+DEBUG_LOG_PATH = Path("/Users/zzm/.cursor/debug-0bdcc8.log")
+DEBUG_SESSION_ID = "0bdcc8"
+FETCH_HOME_META: Dict[str, str] = {}
+
+
+def _sanitize_fetch_snippet(text: str) -> str:
+    if not text:
+        return ""
+    t = re.sub(r"'cookie'\s*:\s*'[^']*'", "'cookie':'[redacted]'", text, flags=re.I)
+    t = re.sub(r'"cookie"\s*:\s*"[^"]*"', '"cookie":"[redacted]"', t, flags=re.I)
+    return t[:800]
+
+
+def _is_cn_home(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.netloc.endswith("cn.wsj.com") and p.path in ("", "/")
+    except Exception:
+        return False
+
+
+def _dbg(run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+    payload = {
+        "sessionId": DEBUG_SESSION_ID,
+        "id": f"log_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}",
+        "timestamp": int(time.time() * 1000),
+        "location": location,
+        "message": message,
+        "data": data,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+    }
+    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 @dataclass
@@ -44,10 +84,30 @@ def normalize_url(base: str) -> str:
     return b if b.endswith("/chat/completions") else f"{b}/chat/completions"
 
 
-def load_netscape_cookies() -> Dict[str, str]:
-    cookie_file = Path(os.getenv("COOKIE_FILE", "")).expanduser()
+def load_netscape_cookies(run_id: str = "runtime") -> Dict[str, str]:
+    raw_path = os.getenv("COOKIE_FILE", "").strip()
     jar: Dict[str, str] = {}
-    if not cookie_file.exists():
+    if not raw_path:
+        # #region agent log
+        _dbg(run_id, "H1", "run.py:load_netscape_cookies", "COOKIE_FILE not set", {})
+        # #endregion
+        return jar
+    cookie_file = Path(raw_path).expanduser()
+    total_rows = 0
+    expirable_rows = 0
+    expired_rows = 0
+    now_ts = int(time.time())
+    name_list: List[str] = []
+    if not cookie_file.is_file():
+        # #region agent log
+        _dbg(
+            run_id,
+            "H1",
+            "run.py:load_netscape_cookies",
+            "cookie file missing or not a file",
+            {"cookie_file": str(cookie_file)},
+        )
+        # #endregion
         return jar
     for line in cookie_file.read_text(encoding="utf-8", errors="ignore").splitlines():
         raw = line.strip()
@@ -59,56 +119,244 @@ def load_netscape_cookies() -> Dict[str, str]:
             continue
         parts = raw.split("\t")
         if len(parts) >= 7 and parts[5].strip():
-            jar[parts[5].strip()] = parts[6].strip()
+            total_rows += 1
+            try:
+                exp = int(parts[4].strip())
+                if exp > 0:
+                    expirable_rows += 1
+                    if exp < now_ts:
+                        expired_rows += 1
+            except Exception:
+                pass
+            nm = parts[5].strip()
+            name_list.append(nm)
+            jar[nm] = parts[6].strip()
+    critical_names = ["wsjregion", "DJSESSIONID", "djcs_route", "djcs_oauth", "cX_P"]
+    critical_presence = {k: (k in jar) for k in critical_names}
+    dup_counts = Counter(name_list)
+    dup_names = [n for n, c in dup_counts.items() if c > 1]
+    # #region agent log
+    _dbg(
+        run_id,
+        "H1",
+        "run.py:load_netscape_cookies",
+        "cookie file parsed",
+        {
+            "cookie_file": str(cookie_file),
+            "cookie_count": len(jar),
+            "total_rows": total_rows,
+            "expirable_rows": expirable_rows,
+            "expired_rows": expired_rows,
+            "critical_presence": critical_presence,
+            "duplicate_name_count": len(dup_names),
+            "duplicate_names_sample": dup_names[:15],
+        },
+    )
+    # #endregion
     return jar
 
 
-def fetch_html(url: str, cookies: Dict[str, str]) -> str:
+def load_playwright_cookies() -> List[dict]:
+    raw_path = os.getenv("COOKIE_FILE", "").strip()
+    if not raw_path:
+        return []
+    cookie_file = Path(raw_path).expanduser()
+    out: List[dict] = []
+    if not cookie_file.is_file():
+        return out
+    for line in cookie_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        raw = line.strip()
+        if not raw:
+            continue
+        if raw.startswith("#HttpOnly_"):
+            raw = raw[len("#HttpOnly_") :]
+        elif raw.startswith("#"):
+            continue
+        parts = raw.split("\t")
+        if len(parts) < 7:
+            continue
+        domain, _, path, secure, _, name, value = parts[:7]
+        if not name.strip():
+            continue
+        dom = domain.strip()
+        if dom.startswith("."):
+            dom = dom[1:]
+        out.append(
+            {
+                "name": name.strip(),
+                "value": value.strip(),
+                "domain": dom or "cn.wsj.com",
+                "path": path or "/",
+                "secure": secure.upper() == "TRUE",
+                "sameSite": "None",
+            }
+        )
+    return out
+
+
+def fetch_html(url: str, cookies: Dict[str, str], run_id: str = "runtime") -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
     with httpx.Client(timeout=25, follow_redirects=True) as client:
         r = client.get(url, headers=headers, cookies=cookies)
+        # #region agent log
+        _dbg(
+            run_id,
+            "H2",
+            "run.py:fetch_html",
+            "http fetch response",
+            {"url": url, "status_code": r.status_code, "cookie_count": len(cookies)},
+        )
+        # #endregion
         if r.status_code in (401, 403):
-            return fetch_html_playwright(url, cookies)
+            # #region agent log
+            raw_snip = re.sub(r"\s+", " ", (r.text or "")[:1200])
+            snippet = _sanitize_fetch_snippet(raw_snip)
+            if _is_cn_home(url):
+                FETCH_HOME_META["http_401_body"] = snippet
+            _dbg(
+                run_id,
+                "H6",
+                "run.py:fetch_html",
+                "http 401/403 body snippet",
+                {"url": url, "snippet": snippet},
+            )
+            # #endregion
+            return fetch_html_playwright(url, cookies, run_id)
         r.raise_for_status()
         return r.text
 
 
-def fetch_html_playwright(url: str, cookies: Dict[str, str]) -> str:
+def fetch_html_playwright(url: str, cookies: Dict[str, str], run_id: str = "runtime") -> str:
     async def _go() -> str:
         from playwright.async_api import async_playwright
+        try:
+            from playwright_stealth import Stealth
+            manager = Stealth().use_async(async_playwright())
+        except Exception:
+            manager = async_playwright()
 
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True, args=["--no-sandbox"])
-            ctx = await browser.new_context(
+        async with manager as p:
+            launch_args = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+            use_ch = os.getenv("PLAYWRIGHT_USE_CHROME_CHANNEL", "1").lower() in ("1", "true", "yes")
+            browser = None
+            if use_ch:
+                try:
+                    browser = await p.chromium.launch(headless=True, channel="chrome", args=launch_args)
+                    # #region agent log
+                    _dbg(run_id, "H7", "run.py:fetch_html_playwright", "playwright launch", {"channel": "chrome"})
+                    # #endregion
+                except Exception as le:
+                    # #region agent log
+                    _dbg(
+                        run_id,
+                        "H7",
+                        "run.py:fetch_html_playwright",
+                        "playwright chrome channel failed",
+                        {"error": str(le)[:200]},
+                    )
+                    # #endregion
+                    browser = None
+            if browser is None:
+                browser = await p.chromium.launch(headless=True, args=launch_args)
+                # #region agent log
+                _dbg(run_id, "H7", "run.py:fetch_html_playwright", "playwright launch", {"channel": "chromium"})
+                # #endregion
+            storage_path = os.getenv("PLAYWRIGHT_STORAGE_STATE", "").strip()
+            base_ctx = dict(
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
                 viewport={"width": 1366, "height": 900},
             )
-            if cookies:
-                await ctx.add_cookies(
-                    [
-                        {
-                            "name": k,
-                            "value": v,
-                            "domain": "cn.wsj.com",
-                            "path": "/",
-                            "secure": True,
-                            "sameSite": "None",
-                        }
-                        for k, v in cookies.items()
-                    ]
-                )
+            if storage_path and Path(storage_path).expanduser().exists():
+                sp = str(Path(storage_path).expanduser())
+                # #region agent log
+                _dbg(run_id, "H7", "run.py:fetch_html_playwright", "using playwright storage_state", {"path": sp})
+                # #endregion
+                ctx = await browser.new_context(**base_ctx, storage_state=sp)
+            else:
+                ctx = await browser.new_context(**base_ctx)
+            await ctx.set_extra_http_headers(
+                {
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Referer": "https://cn.wsj.com/",
+                }
+            )
+            if not (storage_path and Path(storage_path).expanduser().exists()):
+                pw_cookies = load_playwright_cookies()
+                if pw_cookies:
+                    await ctx.add_cookies(pw_cookies)
+                elif cookies:
+                    await ctx.add_cookies(
+                        [
+                            {
+                                "name": k,
+                                "value": v,
+                                "domain": "cn.wsj.com",
+                                "path": "/",
+                                "secure": True,
+                                "sameSite": "None",
+                            }
+                            for k, v in cookies.items()
+                        ]
+                    )
             page = await ctx.new_page()
             resp = await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            # #region agent log
+            _dbg(
+                run_id,
+                "H2",
+                "run.py:fetch_html_playwright",
+                "playwright goto response",
+                {"url": url, "status": int(resp.status) if resp else None},
+            )
+            # #endregion
             if resp and resp.status >= 400:
+                text_snip = ""
+                try:
+                    raw_html = await page.content()
+                    text_snip = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
+                    text_snip = _sanitize_fetch_snippet(re.sub(r"\s+", " ", text_snip)[:1200])
+                except Exception as pe:
+                    text_snip = f"(could not read page: {pe})"
+                # #region agent log
+                _dbg(
+                    run_id,
+                    "H6",
+                    "run.py:fetch_html_playwright",
+                    "playwright error page text snippet",
+                    {"url": url, "status": int(resp.status), "snippet": text_snip},
+                )
+                # #endregion
                 raise RuntimeError(f"playwright status={resp.status}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
             html = await page.content()
             await browser.close()
             return html
 
     return asyncio.run(_go())
+
+
+def network_preflight(run_id: str) -> None:
+    checks = []
+    for host in ("cn.wsj.com", "geo.captcha-delivery.com"):
+        item = {"host": host, "resolve_ok": False, "tcp_ok": False, "error": ""}
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+            item["resolve_ok"] = bool(infos)
+        except Exception as exc:
+            item["error"] = f"resolve:{exc}"
+            checks.append(item)
+            continue
+        try:
+            with socket.create_connection((host, 443), timeout=4):
+                item["tcp_ok"] = True
+        except Exception as exc:
+            item["error"] = f"tcp:{exc}"
+        checks.append(item)
+    # #region agent log
+    _dbg(run_id, "H12", "run.py:network_preflight", "network preflight", {"checks": checks})
+    # #endregion
 
 
 def parse_bj(raw: Optional[str]) -> Optional[datetime]:
@@ -123,16 +371,194 @@ def parse_bj(raw: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def in_last_24h(published: Optional[datetime], now: datetime) -> bool:
+def brief_window_hours() -> int:
+    raw = os.getenv("BRIEF_WINDOW_HOURS", "24").strip()
+    try:
+        h = int(raw)
+        return max(1, min(24 * 14, h))
+    except Exception:
+        return 24
+
+
+def in_brief_window(published: Optional[datetime], now: datetime, hours: int) -> bool:
     if not published:
         return False
-    return now - timedelta(hours=24) <= published <= now
+    return now - timedelta(hours=hours) <= published <= now
 
 
-def article_links(cookies: Dict[str, str]) -> List[str]:
+def _xml_local_name(tag: str) -> str:
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def canonical_wsj_article_url(url: str) -> str:
+    u = (url or "").split("?")[0].strip()
+    if "/amp/articles/" in u:
+        u = u.replace("/amp/articles/", "/articles/")
+    return u.rstrip("/")
+
+
+def _is_cn_article_url(url: str) -> bool:
     try:
-        html = fetch_html("https://cn.wsj.com/", cookies)
+        p = urlparse(url)
+        return p.netloc.endswith("cn.wsj.com") and "/articles/" in p.path
     except Exception:
+        return False
+
+
+def html_fragment_to_text(fragment: str) -> str:
+    if not fragment:
+        return ""
+    soup = BeautifulSoup(fragment, "html.parser")
+    t = soup.get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def rss_env_feed_urls() -> List[str]:
+    raw = os.getenv("WSJ_RSS_URLS", os.getenv("RSS_URLS", "")).strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def fetch_rss_xml(feed_url: str, run_id: str) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; CN-WSJ-Briefing/1.0)"}
+    with httpx.Client(timeout=40, follow_redirects=True) as client:
+        r = client.get(feed_url, headers=headers)
+        # #region agent log
+        _dbg(
+            run_id,
+            "H13",
+            "run.py:fetch_rss_xml",
+            "rss fetch",
+            {"url": feed_url, "status": r.status_code, "bytes": len(r.content or b"")},
+        )
+        # #endregion
+        r.raise_for_status()
+        return r.text
+
+
+def parse_rss_items(xml_text: str, run_id: str, feed_url: str) -> List[Tuple[str, dict]]:
+    out: List[Tuple[str, dict]] = []
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception as exc:
+        _dbg(run_id, "H13", "run.py:parse_rss_items", "rss xml parse failed", {"feed": feed_url, "error": str(exc)[:200]})
+        return out
+    tag0 = _xml_local_name(root.tag).lower()
+
+    def add_item(link: str, title: str, pub_raw: str, desc_html: str, enc_html: str) -> None:
+        link_u = link.strip()
+        if not link_u or not title.strip():
+            return
+        if not link_u.startswith("http"):
+            return
+        if not _is_cn_article_url(canonical_wsj_article_url(link_u)):
+            return
+        canon = canonical_wsj_article_url(link_u)
+        try:
+            slug = urlparse(canon).path.rstrip("/").rsplit("/", 1)[-1]
+        except Exception:
+            slug = ""
+        if not slug or slug.startswith("-"):
+            return
+        body_html = enc_html.strip() if enc_html.strip() else desc_html
+        hint = {
+            "title": title.strip(),
+            "published_raw": pub_raw.strip(),
+            "published_bj": parse_bj(pub_raw) if pub_raw.strip() else None,
+            "description_html": body_html.strip(),
+            "rss_feed": feed_url,
+        }
+        out.append((canon, hint))
+
+    if tag0 == "rss":
+        for item in root.findall(".//item"):
+            title = ""
+            link = ""
+            pub_raw = ""
+            desc_html = ""
+            enc_html = ""
+            for child in item:
+                ln = _xml_local_name(child.tag).lower()
+                if ln == "title":
+                    title = "".join(child.itertext()).strip()
+                elif ln == "link":
+                    link = (child.text or "").strip()
+                elif ln == "pubdate":
+                    pub_raw = (child.text or "").strip()
+                elif ln == "description":
+                    desc_html = "".join(child.itertext()).strip()
+                elif ln.endswith("encoded") or ln == "encoded":
+                    enc_html = "".join(child.itertext()).strip()
+                elif ln == "guid":
+                    gt = child.get("isPermaLink", "").lower()
+                    gv = (child.text or "").strip()
+                    if gt == "false" or (gv.startswith("http") and "wsj.com" in gv):
+                        link = link or gv
+            add_item(link or "", title, pub_raw, desc_html, enc_html)
+        _dbg(run_id, "H13", "run.py:parse_rss_items", "rss items parsed", {"feed": feed_url, "items": len(out)})
+        return out
+
+    if tag0 == "feed":
+        atom = "{http://www.w3.org/2005/Atom}"
+        for entry in root.findall(f"{atom}entry"):
+            title_el = entry.find(f"{atom}title")
+            title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+            link = ""
+            for ln in entry.findall(f"{atom}link"):
+                href = (ln.get("href") or "").strip()
+                if not href:
+                    continue
+                rel = (ln.get("rel") or "alternate").lower()
+                if rel in ("alternate", "self", ""):
+                    link = href
+                    break
+            if not link:
+                for ln in entry.findall(f"{atom}link"):
+                    href = (ln.get("href") or "").strip()
+                    if href:
+                        link = href
+                        break
+            pub_raw = ""
+            for tag in ("updated", "published"):
+                pe = entry.find(f"{atom}{tag}")
+                if pe is not None and (pe.text or "").strip():
+                    pub_raw = (pe.text or "").strip()
+                    break
+            summary_el = entry.find(f"{atom}summary")
+            summary_txt = "".join(summary_el.itertext()).strip() if summary_el is not None else ""
+            content_el = entry.find(f"{atom}content")
+            content_txt = "".join(content_el.itertext()).strip() if content_el is not None else ""
+            add_item(link or "", title, pub_raw, summary_txt, content_txt)
+        _dbg(run_id, "H13", "run.py:parse_rss_items", "atom items parsed", {"feed": feed_url, "items": len(out)})
+        return out
+
+    _dbg(run_id, "H13", "run.py:parse_rss_items", "rss unknown root", {"feed": feed_url, "root": tag0})
+    return out
+
+
+def rss_discover(feed_urls: List[str], run_id: str) -> Dict[str, dict]:
+    by_url: Dict[str, dict] = {}
+    for fu in feed_urls:
+        try:
+            xml_txt = fetch_rss_xml(fu, run_id)
+            for canon, hint in parse_rss_items(xml_txt, run_id, fu):
+                if canon not in by_url:
+                    by_url[canon] = hint
+        except Exception as exc:
+            print(f"[DEBUG] rss feed failed ({fu}): {exc}")
+            _dbg(run_id, "H13", "run.py:rss_discover", "rss feed exception", {"feed": fu, "error": str(exc)[:240]})
+    return by_url
+
+
+def article_links(cookies: Dict[str, str], run_id: str = "runtime") -> List[str]:
+    try:
+        html = fetch_html("https://cn.wsj.com/", cookies, run_id)
+    except Exception as exc:
+        # #region agent log
+        _dbg(run_id, "H2", "run.py:article_links", "homepage fetch exception", {"error": str(exc)})
+        # #endregion
+        print(f"[DEBUG] homepage fetch failed: {exc}")
         return []
     soup = BeautifulSoup(html, "html.parser")
     seen = set()
@@ -149,12 +575,50 @@ def article_links(cookies: Dict[str, str]) -> List[str]:
             continue
         seen.add(href)
         out.append(href)
+    # #region agent log
+    _dbg(run_id, "H2", "run.py:article_links", "homepage links extracted", {"count": len(out)})
+    # #endregion
     return out
 
 
-def parse_article(url: str, cookies: Dict[str, str]) -> Optional[dict]:
+def article_from_rss_hint(url: str, hint: dict, run_id: str) -> Optional[dict]:
+    body_html = hint.get("description_html") or ""
+    body = html_fragment_to_text(body_html)
+    if len(body) < 60:
+        # #region agent log
+        _dbg(run_id, "H14", "run.py:article_from_rss_hint", "rss body too short", {"url": url, "chars": len(body)})
+        # #endregion
+        return None
+    title = (hint.get("title") or "").strip()
+    if not title:
+        title = "（RSS 未提供标题）"
+    lede_txt = body[:260] + ("…" if len(body) > 260 else "")
+    pub = hint.get("published_bj")
+    if not pub:
+        pub = parse_bj((hint.get("published_raw") or "").strip())
+    # #region agent log
+    _dbg(
+        run_id,
+        "H14",
+        "run.py:article_from_rss_hint",
+        "article built from rss",
+        {"url": url, "chars": len(body), "has_pub": bool(pub)},
+    )
+    # #endregion
+    return {
+        "url": url,
+        "title": title,
+        "lede": lede_txt.strip() if lede_txt.strip() else "（由 RSS/HTML 摘录生成导语）",
+        "image_url": "",
+        "published_bj": pub,
+        "body": body[:12000],
+        "body_source": "rss",
+    }
+
+
+def parse_article(url: str, cookies: Dict[str, str], run_id: str = "runtime") -> Optional[dict]:
     try:
-        html = fetch_html(url, cookies)
+        html = fetch_html(url, cookies, run_id)
         soup = BeautifulSoup(html, "html.parser")
         title = (soup.select_one("meta[property='og:title']") or {}).get("content", "").strip()
         if not title and soup.title:
@@ -185,16 +649,33 @@ def parse_article(url: str, cookies: Dict[str, str]) -> Optional[dict]:
             body_parts = [p.get_text(" ", strip=True) for p in soup.select("p")]
         body = "\n".join([x for x in body_parts if x and len(x) > 20])[:12000]
         if not body:
+            body = (lede or title or "").strip()
+        if not body:
+            # #region agent log
+            _dbg(run_id, "H3", "run.py:parse_article", "article dropped: empty body", {"url": url, "title": title})
+            # #endregion
             return None
+        pub = parse_bj(published) or parse_bj(modified)
+        # #region agent log
+        _dbg(
+            run_id,
+            "H3",
+            "run.py:parse_article",
+            "article parsed",
+            {"url": url, "has_title": bool(title), "has_lede": bool(lede), "has_body": bool(body), "has_pub": bool(pub)},
+        )
+        # #endregion
         return {
             "url": url,
             "title": title,
             "lede": lede or "（站点未提供明确导语）",
             "image_url": image,
-            "published_bj": parse_bj(published) or parse_bj(modified),
+            "published_bj": pub,
             "body": body,
+            "body_source": "site",
         }
-    except Exception:
+    except Exception as exc:
+        print(f"[DEBUG] parse_article failed: {url} -> {exc}")
         return None
 
 
@@ -283,6 +764,15 @@ def _sentiment_display_html(summ: dict) -> str:
     )
 
 
+def _with_rss_note(article: dict, summ: dict) -> dict:
+    if article.get("body_source") != "rss":
+        return summ
+    extra = "正文素材来自 RSS/第三方订阅源中的摘要或片段，可能与 cn.wsj.com 官网全文不一致。"
+    prev = str(summ.get("_note") or "").strip()
+    summ["_note"] = (prev + " " if prev else "") + extra
+    return summ
+
+
 def summarize(article: dict) -> dict:
     prompt = f"""你是一名财经新闻分析师。请输出 JSON:
 {{
@@ -300,7 +790,8 @@ def summarize(article: dict) -> dict:
 正文:
 {article['body']}
 """
-    return call_llm(prompt, article)
+    out = call_llm(prompt, article)
+    return _with_rss_note(article, out)
 
 
 def download_image(url: str, idx: int, run_id: str, cookies: Dict[str, str]) -> Optional[str]:
@@ -516,7 +1007,7 @@ a:hover {{ text-decoration:underline; }}
     <header class="masthead">
       <h1>The Wall Street Journal</h1>
       <p class="tagline">China edition briefing · cn.wsj.com</p>
-      <p class="run-id">Run · {safe_run} · 生成时间 Generated {html.escape(now_bj().strftime("%Y-%m-%d %H:%M:%S"))} · 过去24小时（北京时间）</p>
+      <p class="run-id">Run · {safe_run} · 生成时间 Generated {html.escape(now_bj().strftime("%Y-%m-%d %H:%M:%S"))} · 时间窗 {brief_window_hours()}h（北京时间）</p>
     </header>
     {''.join(cards) if cards else '<p class="empty">本版暂无符合条件的文章（时间窗口内无可用正文或全部被站点拦截）。</p>'}
   </main>
@@ -560,21 +1051,100 @@ def render_portal(run_id: str, records_count: int) -> Path:
 
 def run() -> int:
     run_id = now_bj().strftime("%Y-%m-%d_%H-%M-%S")
-    cookies = load_netscape_cookies()
-    if not cookies:
-        print("警告：未读取到 COOKIE_FILE，cn.wsj.com 可能返回 401。")
+    FETCH_HOME_META.clear()
+    network_preflight(run_id)
+    cookies = load_netscape_cookies(run_id)
+    raw_cookie = os.getenv("COOKIE_FILE", "").strip()
+    if raw_cookie:
+        if not cookies:
+            print("警告：COOKIE_FILE 已指定但 Cookie 为空或路径无效。")
+    else:
+        print("提示：未设置 COOKIE_FILE；站点正文抓取将依赖 PLAYWRIGHT_STORAGE_STATE（若配置了 RSS 则可能仅用 RSS 文本）。")
+
+    discovery = os.getenv("ARTICLE_DISCOVERY", "both").strip().lower()
+    if discovery not in ("homepage", "rss", "both"):
+        discovery = "both"
+
+    rss_feed_urls = rss_env_feed_urls()
+    rss_hints: Dict[str, dict] = {}
+    rss_order: List[str] = []
+
+    if discovery in ("rss", "both"):
+        if not rss_feed_urls:
+            print("提示：未发现 WSJ_RSS_URLS/RSS_URLS（建议在 DataDome 拦截时填写公开或自建 RSS，逗号分隔多个地址）。")
+        else:
+            rss_hints = rss_discover(rss_feed_urls, run_id)
+            rss_order = list(rss_hints.keys())
+
+    home_links: List[str] = []
+    if discovery in ("homepage", "both"):
+        home_links = article_links(cookies, run_id)
+
+    ordered: List[str] = []
+    seen_merge: set = set()
+    for u in rss_order:
+        if u not in seen_merge:
+            seen_merge.add(u)
+            ordered.append(u)
+    for h in home_links:
+        c = canonical_wsj_article_url(h)
+        if c not in seen_merge:
+            seen_merge.add(c)
+            ordered.append(c)
+
+    print(
+        f"[DEBUG] discovery={discovery!r} rss_feeds={len(rss_feed_urls)} rss_items={len(rss_hints)} "
+        f"homepage_links={len(home_links)} merged={len(ordered)}"
+    )
+
+    if discovery == "rss" and not rss_feed_urls:
+        print("[ERROR] ARTICLE_DISCOVERY=rss 但未配置 WSJ_RSS_URLS（或 RSS_URLS）。")
+        return 2
+
     now = now_bj()
-    links = article_links(cookies)
+    window_h = brief_window_hours()
+    home_snip = FETCH_HOME_META.get("http_401_body", "")
+    if discovery in ("homepage", "both") and len(home_links) == 0 and (
+        "captcha-delivery" in home_snip.lower() or "geo.captcha-delivery" in home_snip.lower()
+    ):
+        msg = (
+            "首页返回反爬/验证码页（DataDome，见日志 H6）。可改用 RSS：设置 WSJ_RSS_URLS 并将 ARTICLE_DISCOVERY=rss|both；"
+            "或在本机用有界面浏览器登录后执行 scripts/save_cn_wsj_storage_state.py，并设置 PLAYWRIGHT_STORAGE_STATE。"
+        )
+        print(f"[BLOCKED] {msg}")
+        # #region agent log
+        _dbg(
+            run_id,
+            "H9",
+            "run.py:run",
+            "homepage blocked by bot challenge",
+            {"hint": "datadome", "has_storage_state": bool(os.getenv("PLAYWRIGHT_STORAGE_STATE", "").strip()), "rss_items": len(rss_hints)},
+        )
+        # #endregion
+
     seen_urls: set = set()
     records = []
+    parsed_ok = 0
+    missing_time = 0
+    out_of_window = 0
     idx = 0
-    for link in links:
+    for link in ordered:
         if link in seen_urls:
             continue
-        art = parse_article(link, cookies)
+        rss_hint = rss_hints.get(link)
+        art = parse_article(link, cookies, run_id)
+        if art and rss_hint and not art.get("published_bj") and rss_hint.get("published_bj"):
+            art["published_bj"] = rss_hint["published_bj"]
+        elif not art and rss_hint:
+            art = article_from_rss_hint(link, rss_hint, run_id)
         if not art:
             continue
-        if not in_last_24h(art.get("published_bj"), now):
+        parsed_ok += 1
+        if not in_brief_window(art.get("published_bj"), now, window_h):
+            if not art.get("published_bj"):
+                missing_time += 1
+            else:
+                out_of_window += 1
             continue
         seen_urls.add(link)
         idx += 1
@@ -593,6 +1163,26 @@ def run() -> int:
         )
     run_page = render(records, run_id)
     render_portal(run_id, len(records))
+    print(
+        f"[DEBUG] parsed_ok={parsed_ok}, missing_time={missing_time}, out_of_window={out_of_window}, final_records={len(records)}"
+    )
+    # #region agent log
+    _dbg(
+        run_id,
+        "H4",
+        "run.py:run",
+        "run summary",
+        {
+            "homepage_links": len(home_links),
+            "rss_items": len(rss_hints),
+            "merged_links": len(ordered),
+            "parsed_ok": parsed_ok,
+            "missing_time": missing_time,
+            "out_of_window": out_of_window,
+            "final_records": len(records),
+        },
+    )
+    # #endregion
     print(f"Generated run page: {run_page}")
     print(f"Latest portal: {DOCS / 'index.html'}")
     return 0

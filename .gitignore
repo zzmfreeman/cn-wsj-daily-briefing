@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .DS_Store
 state_seen.json
+cn_wsj_storage.json
